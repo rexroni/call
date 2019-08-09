@@ -16,7 +16,7 @@
 #include "config.h"
 
 typedef struct {
-    const char* phone_number;
+    char phone_number[128];
     pjsua_acc_id aid;
     pjsua_call_id cid;
     bool rx;
@@ -263,9 +263,29 @@ int main(int argc, char** argv){
     if(argc < 2){
         pg.rx = true;
     }else{
-        // grab phone number for later use
-        pg.phone_number = argv[1];
         pg.rx = false;
+        /* Grab phone number for later use.  It can have spaces or non-digits,
+           but they will just get dropped.  It is utf8-stoopid. */
+        size_t idx = 0;
+        size_t argidx = 1;
+        size_t argpos = 0;
+        while(idx < sizeof(pg.phone_number) - 1 && argidx < argc){
+            char c = argv[argidx][argpos];
+            if(c == '\0'){
+                // next arg
+                argpos = 0;
+                argidx++;
+                continue;
+            }
+            if(c >= '0' && c <= '9'){
+                // keep character
+                pg.phone_number[idx++] = c;
+            }
+            // next character
+            argpos++;
+        }
+        // null terminate
+        pg.phone_number[idx] = '\0';
     }
 
     // set sigint
