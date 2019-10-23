@@ -1,6 +1,8 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <sys/wait.h>
+#include <errno.h>
+#include <termios.h>
 
 #include <pjlib.h>
 #include <pjlib-util.h>
@@ -146,34 +148,82 @@ int reg_unreg(pjsip_globals_t *pg){
         return 40;
     }
 
-    // do stuff
-    if(pg->rx){
-        // wait for call to end, or SIGINT to be received
-        while(should_cont){
-            // .1 seconds
-            usleep(100000);
-        }
-        if(in_call){
-            // hangup nicely
-            pjsua_call_hangup(rx_call_id, 0, NULL, NULL);
-        }
-    }else{
+    // prepare the terminal
+    struct termios old_tios;
+    // store terminal settings
+    int ret = tcgetattr(0, &old_tios);
+    if(ret != 0){
+        perror("tcgetattr");
+        exit(1);
+    }
+
+    struct termios new_tios = old_tios;
+    // turn off echo and make terminal non-blocking
+    new_tios.c_lflag &= ~(ICANON | ECHO);
+    new_tios.c_cc[VMIN] = 0;
+    new_tios.c_cc[VTIME] = 0;
+    ret = tcsetattr(0, TCSANOW, &new_tios);
+    if(ret != 0){
+        perror("tcsetattr");
+        return 41;
+    }
+
+
+    // dial
+    if(!pg->rx){
         retval = dial_number(pg);
-        if(retval == 0){
-            // wait for call to end, or SIGINT to be received
-            while(should_cont){
-                // .1 seconds
-                usleep(100000);
-            }
-            // hangup nicely
-            pjsua_call_hangup(pg->cid, 0, NULL, NULL);
+        if(retval !=0) goto call_done;
+    }
+
+    // wait for call to end, or SIGINT to be received
+    while(should_cont){
+        // try to read an ascii 0-9 char from stdin
+        char c = 0;
+        ssize_t read_ret = read(0, &c, 1);
+        if(read_ret == 0 ||
+                (read_ret == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))){
+            // nothing to read, wait .1 seconds and try again
+            usleep(100000);
+            continue;
         }
+        if(read_ret == -1){
+            perror("read from stdin");
+            retval = 44;
+            goto call_done;
+        }
+
+        // make sure we got a digit
+        if(!(c >= '0' && c <= '9') && c != '#' && c != '*'){
+            printf("invalid dtmf character: %c\r\n", c);
+            continue;
+        }
+
+        // make sure we either dialed, or if we received and are in_call
+        if(!pg->rx || in_call){
+            // send the digit
+            pj_str_t digit = {.ptr=&c, .slen=1};
+            pjsua_call_id call_id = pg->rx ? rx_call_id : pg->cid;
+            pret = pjsua_call_dial_dtmf(call_id, &digit);
+        }
+    }
+
+    // hang up if we either dialed, or if we received and are in_call
+    if(!pg->rx || in_call){
+        // hangup nicely
+        pjsua_call_hangup(pg->rx ? rx_call_id : pg->cid, 0, NULL, NULL);
+    }
+
+call_done:
+    ret = tcsetattr(0, TCSANOW, &old_tios);
+    if(ret != 0){
+        perror("tcsetattr");
+        return 45;
     }
 
     pret = pjsua_acc_del(pg->aid);
     if(pret != PJ_SUCCESS){
         //psjua_perror("sender", "title", pret);
-        return 41;
+        return 46;
     }
     return retval;
 }
