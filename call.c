@@ -237,6 +237,64 @@ int pjstart(pjsip_globals_t *pg){
         return 30;
     }
 
+    /* I know there's no echo from my headset side, but I hear a slight echo
+       on the phone side anyway.  I thought that might be due to ghost echos
+       created by echo cancellation, but when I disabled echo cancellation it
+       only got worse. */
+    // // disable echo cancellation
+    // pret = pjsua_set_ec(0, 0);
+    // if(pret != PJ_SUCCESS){
+    //     //psjua_perror("sender", "title", pret);
+    //     return 32;
+    // }
+
+    pjmedia_snd_dev_info info[100];
+    unsigned count = 100;
+
+    // enumerate sound devices
+    pret = pjsua_enum_snd_devs(info, &count);
+    if(pret != PJ_SUCCESS){
+        //psjua_perror("sender", "title", pret);
+        return 33;
+    }
+
+    // find the pulse sound device
+    int pulse = -1;
+    printf("sound device count = %u\n", count);
+    for(unsigned i = 0; i < count; i++){
+        pjmedia_snd_dev_info inf = info[i];
+        printf(
+            "sound device name: \"% .40s\" inputs: %u outputs %u\n",
+            inf.name, inf.input_count, inf.output_count
+        );
+
+        if(strcmp(inf.name, "pulse") == 0){
+            pulse = i;
+        }
+    }
+    if(pulse < 0){
+        printf("did not find pulse sound device!\n");
+        return 34;
+    }
+
+    // validate the pulse sound device
+    pjmedia_snd_dev_info pulse_dev = info[pulse];
+    if(info[pulse].input_count == 0){
+        printf("pulse has no inputs!\n");
+        return 35;
+    }
+    if(info[pulse].output_count == 0){
+        printf("pulse has no ouputs!\n");
+        return 36;
+    }
+
+    // use the pulse sound device
+    pret = pjsua_set_snd_dev(pulse, pulse);
+    if(pret != PJ_SUCCESS){
+        //psjua_perror("sender", "title", pret);
+        return 35;
+    }
+
     return reg_unreg(pg);
 }
 
