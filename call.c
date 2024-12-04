@@ -3,6 +3,7 @@
 #include <sys/wait.h>
 #include <errno.h>
 #include <termios.h>
+#include <sys/select.h>
 
 #include <pjlib.h>
 #include <pjlib-util.h>
@@ -74,7 +75,6 @@ static int soft_kill = true;
 static void sigint_handler(int signum){
     if(soft_kill){
         printf("catching signal, exiting\n");
-        fclose(stdin);
         should_cont = false;
         soft_kill = false;
     }else{
@@ -158,37 +158,48 @@ int reg_unreg(pjsip_globals_t *pg){
     }
 
     struct termios new_tios = old_tios;
-    // turn off echo and make terminal non-blocking
+    // turn off echo and read characters as they arrive
     new_tios.c_lflag &= ~(ICANON | ECHO);
-    new_tios.c_cc[VMIN] = 0;
-    new_tios.c_cc[VTIME] = 0;
     ret = tcsetattr(0, TCSANOW, &new_tios);
     if(ret != 0){
         perror("tcsetattr");
         return 41;
     }
 
-
     // dial
     if(!pg->rx){
         retval = dial_number(pg);
-        if(retval !=0) goto call_done;
+        if(retval != 0) goto call_done;
     }
 
     // wait for call to end, or SIGINT to be received
     while(should_cont){
-        // try to read an ascii 0-9 char from stdin
-        char c = 0;
-        ssize_t read_ret = read(0, &c, 1);
-        if(read_ret == 0 ||
-                (read_ret == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))){
-            // nothing to read, wait .1 seconds and try again
-            usleep(100000);
+        // wait .1 seconds for data to available on stdin
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(0, &rfds);
+        struct timeval timeout = { .tv_usec = 100000 };
+        int ret = select(1, &rfds, NULL, NULL, &timeout);
+        if(ret == -1) {
+            if(errno == EINTR) continue;
+            perror("select");
+            retval == 44;
+            goto call_done;
+        }
+        if(ret == 0){
+            // timeout
             continue;
         }
-        if(read_ret == -1){
+
+        // try to read an ascii 0-9 char from stdin
+        char c = 0;
+        ssize_t zret = read(0, &c, 1);
+        if(zret < 0){
+            if(errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK){
+                continue;
+            }
             perror("read from stdin");
-            retval = 44;
+            retval = 45;
             goto call_done;
         }
 
@@ -217,13 +228,13 @@ call_done:
     ret = tcsetattr(0, TCSANOW, &old_tios);
     if(ret != 0){
         perror("tcsetattr");
-        return 45;
+        return 46;
     }
 
     pret = pjsua_acc_del(pg->aid);
     if(pret != PJ_SUCCESS){
         //psjua_perror("sender", "title", pret);
-        return 46;
+        return 47;
     }
     return retval;
 }
