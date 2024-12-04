@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <termios.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 
 #include <pjlib.h>
 #include <pjlib-util.h>
@@ -69,12 +70,12 @@ static void on_call_media_state(pjsua_call_id cid){
 }
 
 
-static int should_cont = true;
-static int soft_kill = true;
+static bool should_cont = true;
+static bool soft_kill = true;
 // the second time through this function it will just hard-exit the program
 static void sigint_handler(int signum){
     if(soft_kill){
-        printf("catching signal, exiting\n");
+        fprintf(stderr, "catching signal, exiting\n");
         should_cont = false;
         soft_kill = false;
     }else{
@@ -84,24 +85,45 @@ static void sigint_handler(int signum){
 
 
 // exit automatically if call disconnects
+static bool external_disconnect = false;
 static void on_call_state(pjsua_call_id cid, pjsip_event *e){
     (void)e;
     // get call state
     pjsua_call_info ci;
     pjsua_call_get_info(cid, &ci);
+    char *state = "UNKNOWN";
+    switch(ci.state){
+        case PJSIP_INV_STATE_NULL: state="NULL"; break;
+        case PJSIP_INV_STATE_CALLING: state="CALLING"; break;
+        case PJSIP_INV_STATE_INCOMING: state="INCOMING"; break;
+        case PJSIP_INV_STATE_EARLY: state="EARLY"; break;
+        case PJSIP_INV_STATE_CONNECTING: state="CONNECTING"; break;
+        case PJSIP_INV_STATE_CONFIRMED: state="CONFIRMED"; break;
+        case PJSIP_INV_STATE_DISCONNECTED: state="DISCONNECTED"; break;
+    }
+    #define FMT_PJSTR(x) (int)(x).slen, (x).ptr
+    fprintf(stderr,
+        "call state: %s: \"%.*s\"\n",
+        state, FMT_PJSTR(ci.last_status_text)
+    );
     // if disconnected, end the program
     if(ci.state == PJSIP_INV_STATE_DISCONNECTED){
         pjsua_conf_disconnect(ci.conf_slot, 0);
         pjsua_conf_disconnect(0, ci.conf_slot);
         should_cont = false;
+        external_disconnect = true;
     }
 }
 
 
 int dial_number(pjsip_globals_t *pg){
     // build sip url
-    char sip_url[128];
-    int sip_len = sprintf(sip_url, SIP_PRE "%s" SIP_POST, pg->phone_number);
+    char sip_url[1024];
+    int sip_len = snprintf(
+        sip_url,
+        sizeof(sip_url),
+        SIP_URL_SPRINTF_ARGS(pg->phone_number)
+    );
     if(sip_len > sizeof(sip_url)-1 || sip_len < 0){
         fprintf(stderr, "error during sprintf\n");
         return 50;
@@ -126,9 +148,9 @@ int reg_unreg(pjsip_globals_t *pg){
     // account registered to 9708187541
     pjsip_cred_info creds = {
         .realm = pj_str(REALM),
-        .scheme = pj_str("digest"),
+        .scheme = pj_str(CREDS_SCHEME),
         .username = pj_str(USERNAME),
-        .data_type = PJSIP_CRED_DATA_PLAIN_PASSWD,
+        .data_type = CREDS_DATA_TYPE,
         .data = pj_str(PASSWORD),
     };
 
@@ -139,6 +161,10 @@ int reg_unreg(pjsip_globals_t *pg){
     ac.reg_uri = pj_str(REGISTER_URI);
     ac.cred_info[0] = creds;
     ac.cred_count = 1;
+
+    #if USE_TLS
+    ac.use_srtp = USE_SRTP;
+    #endif
 
     // create the account
     int make_default = 1;
@@ -205,7 +231,7 @@ int reg_unreg(pjsip_globals_t *pg){
 
         // make sure we got a digit
         if(!(c >= '0' && c <= '9') && c != '#' && c != '*'){
-            printf("invalid dtmf character: %c\r\n", c);
+            fprintf(stderr, "invalid dtmf character: %c\r\n", c);
             continue;
         }
 
@@ -218,8 +244,8 @@ int reg_unreg(pjsip_globals_t *pg){
         }
     }
 
-    // hang up if we either dialed, or if we received and are in_call
-    if(!pg->rx || in_call){
+    // hang up if the other side didn't and the call is still active
+    if(!external_disconnect && (!pg->rx || in_call)){
         // hangup nicely
         pjsua_call_hangup(pg->rx ? rx_call_id : pg->cid, 0, NULL, NULL);
     }
@@ -271,10 +297,10 @@ int pjstart(pjsip_globals_t *pg){
 
     // find the pulse sound device
     int pulse = -1;
-    printf("sound device count = %u\n", count);
+    fprintf(stderr, "sound device count = %u\n", count);
     for(unsigned i = 0; i < count; i++){
         pjmedia_snd_dev_info inf = info[i];
-        printf(
+        fprintf(stderr,
             "sound device name: \"% .40s\" inputs: %u outputs %u\n",
             inf.name, inf.input_count, inf.output_count
         );
@@ -284,18 +310,18 @@ int pjstart(pjsip_globals_t *pg){
         }
     }
     if(pulse < 0){
-        printf("did not find pulse sound device!\n");
+        fprintf(stderr, "did not find pulse sound device!\n");
         return 34;
     }
 
     // validate the pulse sound device
     pjmedia_snd_dev_info pulse_dev = info[pulse];
     if(info[pulse].input_count == 0){
-        printf("pulse has no inputs!\n");
+        fprintf(stderr, "pulse has no inputs!\n");
         return 35;
     }
     if(info[pulse].output_count == 0){
-        printf("pulse has no ouputs!\n");
+        fprintf(stderr, "pulse has no ouputs!\n");
         return 36;
     }
 
@@ -310,22 +336,71 @@ int pjstart(pjsip_globals_t *pg){
 }
 
 
+#if USE_TLS
+int guess_ca_list_file(pj_str_t *out){
+    char *paths[] = TLS_BUNDLE_CHECK_PATHS;
+    size_t npaths = sizeof(paths)/sizeof(*paths);
+    for(size_t i = 0; i < npaths; i++){
+        struct stat s;
+        int ret = stat(paths[i], &s);
+        if(ret < 0){
+            // ignore missing files; that's kinda the point
+            if(errno != ENOENT && errno != ENOTDIR){
+                perror(paths[i]);
+            }
+            continue;
+        }
+        // ignore non-regular files
+        if(s.st_mode & S_IFMT != S_IFREG) continue;
+        // found an answer
+        // (note, the string is backed by static memory)
+        *out = pj_str(paths[i]);
+        return 0;
+    }
+    fprintf(stderr,
+        "could not find a TLS certificate bundle; "
+        "checked the following locations:\n"
+    );
+    for(size_t i = 0; i < npaths; i++){
+        fprintf(stderr, "- %s\n", paths[i]);
+    }
+    return -1;
+}
+#endif // USE_TLS
+
+
 int sip_transport(pjsip_globals_t *pg){
     int retval = 0;
 
     // start with default settings
     pjsua_transport_config tc;
     pjsua_transport_config_default(&tc);
-    //tc.port = 5060;
-    // tc.tls_setting // Holy shit, that's complicated.  We'll try again later.
+    #if USE_TLS
+    pjsip_transport_type_e type = PJSIP_TRANSPORT_TLS;
+    pj_str_t ca_list_file;
+    int ret = guess_ca_list_file(&ca_list_file);
+    if(ret) return 20;
+    tc.tls_setting.ca_list_file = ca_list_file;
+    tc.tls_setting.method = PJSIP_TLSV1_3_METHOD;
+    tc.tls_setting.sigalgs = pj_str(
+        "ECDSA+SHA256"
+        ":ECDSA+SHA384"
+        ":ECDSA+SHA512"
+        ":RSA+SHA256"
+        ":RSA+SHA384"
+        ":RSA+SHA512"
+    );
+    tc.tls_setting.verify_server = PJ_TRUE;
+    #else // not USE_TLS
+    pjsip_transport_type_e type = PJSIP_TRANSPORT_UDP;
+    #endif // USE_TLS
 
     // create the transport
-    pjsip_transport_type_e type = PJSIP_TRANSPORT_UDP;
     pjsua_transport_id tid;
     pj_status_t pret = pjsua_transport_create(type, &tc, &tid);
     if(pret != PJ_SUCCESS){
         //psjua_perror("sender", "title", pret);
-        return 20;
+        return 21;
     }
 
     retval = pjstart(pg);
@@ -333,7 +408,7 @@ int sip_transport(pjsip_globals_t *pg){
     pret = pjsua_transport_close(tid, 0);
     if(pret != PJ_SUCCESS){
         //psjua_perror("sender", "title", pret);
-        return 21;
+        return 22;
     }
     return retval;
 }
