@@ -26,29 +26,91 @@ typedef struct {
     bool rx;
 } pjsip_globals_t;
 
+// embed our ring audio
+
+#include "wav.c"
+
+pj_status_t ring_cb(
+    void *user_data,
+    pj_uint32_t timestamp,
+    void *output,
+    unsigned size
+){
+    (void)user_data;
+    size_t bytes_per_sample = ((wav_bits + 7) / 8) * wav_channels;
+    size_t start = timestamp * wav_bytes_per_sample;
+    if(start > sizeof(wav_data)) return 1;
+    size_t copy = size;
+    size_t zero = 0;
+    if(start + size > sizeof(wav_data)){
+        copy = sizeof(wav_data) - start;
+        zero = size - copy;
+    }
+    memcpy(output, wav_data + start, copy);
+    memset(output + copy, 0, zero);
+    return 0;
+}
+
+// play the ring encoded into wav.c
+static int ring_snd_dev = -1;
+int ring(void){
+    pjmedia_snd_stream *stream = NULL;
+    pj_status_t pret = pjmedia_snd_open_player(
+        ring_snd_dev,
+        wav_hz,
+        wav_channels,
+        8192,  // samples_per_frame
+        wav_bits,
+        ring_cb,
+        NULL, // user_data
+        &stream
+    );
+    if(pret != PJ_SUCCESS){
+        return 1;
+    }
+    pret = pjmedia_snd_stream_start(stream);
+    if(pret != PJ_SUCCESS){
+        return 1;
+    }
+    // we know how long it takes to play, so we can sleep just the right amount
+    uint64_t usec = ((uint64_t)wav_samples * 1000000) / wav_hz;
+    usleep(usec);
+    pret = pjmedia_snd_stream_stop(stream);
+    if(pret != PJ_SUCCESS){
+        return 1;
+    }
+    pret = pjmedia_snd_stream_close(stream);
+    if(pret != PJ_SUCCESS){
+        return 1;
+    }
+    return 0;
+}
 
 // auto-answer
 // TODO: not sure how to access pjsip_globals from this callback
 static bool in_call = false;
 static pjsua_call_id rx_call_id;
-static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id,
-                             pjsip_rx_data *rdata){
+static void on_incoming_call(
+    pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_rx_data *rdata
+){
     // respond that we are ringing, makes other side hear ringing too
     pj_status_t pret = pjsua_call_answer(call_id, 180, NULL, NULL);
     if(pret != PJ_SUCCESS){
-        fprintf(stderr, "failed to answer call");
+        fprintf(stderr, "failed to answer call\n");
         exit(1);
     }
 
-    // ring
-    FILE *f = popen(RING_COMMAND, "r");
-    pid_t w = wait(NULL);
-    pclose(f);
+    // actually play the ring audio
+    int ret = ring();
+    if(ret){
+        fprintf(stderr, "failed to play ring audio\n");
+        exit(1);
+    }
 
-    // answer
+    // auto-answer
     pret = pjsua_call_answer(call_id, 200, NULL, NULL);
     if(pret != PJ_SUCCESS){
-        fprintf(stderr, "failed to answer call");
+        fprintf(stderr, "failed to answer call\n");
         exit(1);
     }
     in_call = true;
@@ -265,9 +327,7 @@ call_done:
     return retval;
 }
 
-
 int pjstart(pjsip_globals_t *pg){
-
     pj_status_t pret = pjsua_start();
     if(pret != PJ_SUCCESS){
         //psjua_perror("sender", "title", pret);
@@ -331,6 +391,8 @@ int pjstart(pjsip_globals_t *pg){
         //psjua_perror("sender", "title", pret);
         return 35;
     }
+    // use pulse for the ring as well
+    ring_snd_dev = pulse;
 
     return reg_unreg(pg);
 }
